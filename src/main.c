@@ -26,6 +26,8 @@
 #include <unistd.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
+#include <signal.h>
 
 /* -----------------------------------------------------------------------
  * Constants
@@ -45,7 +47,12 @@
 #define ROMS_MEDIA_DIR   SDCARD_ROOT "/Roms/.media"
 #define COLLECTIONS_DIR  SDCARD_ROOT "/Collections"
 #define RECENTLY_PLAYED  SDCARD_ROOT "/Recently Played"
-#define TOOLS_DIR        SDCARD_ROOT "/Tools/tg5040"
+#if defined(PLATFORM_TG5050)
+#define PLATFORM_TAG     "tg5050"
+#else
+#define PLATFORM_TAG     "tg5040"
+#endif
+#define TOOLS_DIR        SDCARD_ROOT "/Tools/" PLATFORM_TAG
 
 #define DATA_DIR         SDCARD_ROOT "/.userdata/shared/theythemerollin"
 #define THEMES_DIR       DATA_DIR "/themes"
@@ -273,6 +280,12 @@ static bool parse_catalog(void) {
  * Filter catalog for a category
  * ----------------------------------------------------------------------- */
 
+static int compare_entries_alpha(const void *a, const void *b) {
+    const catalog_entry *ea = *(const catalog_entry **)a;
+    const catalog_entry *eb = *(const catalog_entry **)b;
+    return strcasecmp(ea->name, eb->name);
+}
+
 static filtered_list filter_catalog(category_t cat, bool installed_only) {
     filtered_list f = {0};
     for (int i = 0; i < catalog_count; i++) {
@@ -291,6 +304,9 @@ static filtered_list filter_catalog(category_t cat, bool installed_only) {
         if (match && (!installed_only || catalog[i].installed)) {
             f.entries[f.count++] = &catalog[i];
         }
+    }
+    if (f.count > 1) {
+        qsort(f.entries, f.count, sizeof(f.entries[0]), compare_entries_alpha);
     }
     return f;
 }
@@ -369,7 +385,7 @@ static void backup_current(void) {
     char specials[][2][MAX_PATH_LEN] = {
         {SDCARD_ROOT "/.media/Collections.png",       "icons/collections.png"},
         {SDCARD_ROOT "/.media/Recently Played.png",    "icons/recently_played.png"},
-        {SDCARD_ROOT "/Tools/.media/tg5040.png",       "icons/tools.png"},
+        {SDCARD_ROOT "/Tools/.media/" PLATFORM_TAG ".png",       "icons/tools.png"},
     };
     for (int i = 0; i < 3; i++) {
         if (access(specials[i][0], F_OK) == 0) {
@@ -428,7 +444,7 @@ static void restore_backup(void) {
     char specials[][2][MAX_PATH_LEN] = {
         {"icons/collections.png",       SDCARD_ROOT "/.media/Collections.png"},
         {"icons/recently_played.png",   SDCARD_ROOT "/.media/Recently Played.png"},
-        {"icons/tools.png",             SDCARD_ROOT "/Tools/.media/tg5040.png"},
+        {"icons/tools.png",             SDCARD_ROOT "/Tools/.media/" PLATFORM_TAG ".png"},
     };
     for (int i = 0; i < 3; i++) {
         char src[MAX_PATH_BUF];
@@ -522,7 +538,7 @@ static void apply_theme(catalog_entry *entry) {
 
         snprintf(src, sizeof(src), "%s/icons/tools.png", theme_dir);
         if (access(src, F_OK) == 0) {
-            copy_file(src, SDCARD_ROOT "/Tools/.media/tg5040.png");
+            copy_file(src, SDCARD_ROOT "/Tools/.media/" PLATFORM_TAG ".png");
         }
     }
 }
@@ -531,7 +547,7 @@ static void apply_theme(catalog_entry *entry) {
  * Download + install theme
  * ----------------------------------------------------------------------- */
 
-#define UNZIP_BIN  SDCARD_ROOT "/.tmp_update/tg5040/unzip"
+#define UNZIP_BIN  SDCARD_ROOT "/.tmp_update/" PLATFORM_TAG "/unzip"
 
 static bool download_theme(catalog_entry *entry) {
     char tmp_file[MAX_PATH_BUF];
@@ -578,6 +594,117 @@ static bool download_theme(catalog_entry *entry) {
 }
 
 /* -----------------------------------------------------------------------
+ * Preview helpers — resolve images for browse/detail screens
+ * ----------------------------------------------------------------------- */
+
+static bool download_to_cache(const char *url, const char *cache_path) {
+    if (url[0] == '\0') return false;
+    system("mkdir -p \"" DATA_DIR "/previews\"");
+    char cmd[MAX_PATH_BUF * 3];
+    snprintf(cmd, sizeof(cmd),
+             "curl -sfLk -o \"%s\" -m 30 \"%s\"",
+             cache_path, url);
+    return (system(cmd) == 0 && access(cache_path, F_OK) == 0);
+}
+
+/* -----------------------------------------------------------------------
+ * Async preview download
+ * ----------------------------------------------------------------------- */
+
+typedef struct {
+    pid_t pid;                          /* 0 = idle */
+    char  cache_path[MAX_PATH_BUF];     /* final destination */
+    char  entry_id[MAX_NAME_LEN];       /* which entry this is for */
+} async_download_t;
+
+static async_download_t async_dl = {0};
+
+/*
+ * Start a background download. The child process handles everything:
+ * downloads to .tmp, renames to final path on success. If killed,
+ * the .tmp stays and never becomes the final file — no partial files.
+ *
+ * Detaches (does NOT kill) any in-flight download so it can finish
+ * in the background and populate the cache for later.
+ */
+static void async_download_start(const char *url, const char *cache_path, const char *entry_id) {
+    /* Detach any in-flight download — let it finish on its own */
+    if (async_dl.pid > 0) {
+        async_dl.pid = 0;
+    }
+
+    if (url[0] == '\0') return;
+
+    system("mkdir -p \"" DATA_DIR "/previews\"");
+
+    /* Child does: curl → .tmp, then mv → final on success */
+    char cmd[MAX_PATH_BUF * 4];
+    snprintf(cmd, sizeof(cmd),
+             "curl -sfLk -o '%s.tmp' -m 30 '%s' && mv '%s.tmp' '%s'",
+             cache_path, url, cache_path, cache_path);
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        execlp("sh", "sh", "-c", cmd, NULL);
+        _exit(1);
+    } else if (pid > 0) {
+        async_dl.pid = pid;
+        snprintf(async_dl.cache_path, sizeof(async_dl.cache_path), "%s", cache_path);
+        snprintf(async_dl.entry_id, sizeof(async_dl.entry_id), "%s", entry_id);
+    }
+}
+
+/* Returns true if the tracked download finished and file is ready */
+static bool async_download_poll(void) {
+    if (async_dl.pid <= 0) return false;
+
+    int status;
+    pid_t result = waitpid(async_dl.pid, &status, WNOHANG);
+    if (result == 0) return false; /* still running */
+
+    async_dl.pid = 0;
+    return (WIFEXITED(status) && WEXITSTATUS(status) == 0 &&
+            access(async_dl.cache_path, F_OK) == 0);
+}
+
+/* Kill all background downloads (used when leaving the browse screen) */
+static void async_download_cancel(void) {
+    if (async_dl.pid > 0) {
+        kill(async_dl.pid, SIGTERM);
+        waitpid(async_dl.pid, NULL, 0);
+        async_dl.pid = 0;
+    }
+    /* Also reap any detached downloads that finished */
+    while (waitpid(-1, NULL, WNOHANG) > 0) {}
+}
+
+/* Try to resolve preview locally (no network). Returns true if found. */
+static bool resolve_preview_local(catalog_entry *e, char *out, int out_size) {
+    /* Check installed copy */
+    snprintf(out, out_size, "%s/%s/preview.png", THEMES_DIR, e->id);
+    if (access(out, F_OK) == 0) return true;
+
+    /* Check cache */
+    snprintf(out, out_size, DATA_DIR "/previews/%s.preview.png", e->id);
+    if (access(out, F_OK) == 0) return true;
+
+    out[0] = '\0';
+    return false;
+}
+
+/* Resolve preview — blocking download (used by detail screen) */
+static bool resolve_preview(catalog_entry *e, char *out, int out_size) {
+    if (resolve_preview_local(e, out, out_size)) return true;
+
+    /* Download synchronously */
+    snprintf(out, out_size, DATA_DIR "/previews/%s.preview.png", e->id);
+    if (download_to_cache(e->preview_url, out)) return true;
+
+    out[0] = '\0';
+    return false;
+}
+
+/* -----------------------------------------------------------------------
  * Entry detail screen
  * ----------------------------------------------------------------------- */
 
@@ -587,7 +714,7 @@ typedef enum {
     DETAIL_DELETE,
 } detail_result_t;
 
-static detail_result_t show_entry_detail(catalog_entry *e) {
+static detail_result_t show_entry_detail(catalog_entry *e, category_t cat) {
     char subtitle[MAX_NAME_LEN + 32];
     snprintf(subtitle, sizeof(subtitle), "by %s", e->author);
 
@@ -627,33 +754,13 @@ static detail_result_t show_entry_detail(catalog_entry *e) {
         .credit_count = (e->description[0] != '\0') ? 1 : 0,
     };
 
-    /* Load preview image — from disk if installed, download if not */
+    /* Load preview image for detail view — always use preview.png (theme screenshot) */
     SDL_Texture *preview_tex = NULL;
     int preview_w = 0, preview_h = 0;
     {
         char preview_path[MAX_PATH_BUF];
-        snprintf(preview_path, sizeof(preview_path), "%s/%s/preview.png",
-                 THEMES_DIR, e->id);
-
-        /* If not on disk, try downloading to cache */
-        if (access(preview_path, F_OK) != 0 && e->preview_url[0] != '\0') {
-            char cache_dir[MAX_PATH_BUF];
-            snprintf(cache_dir, sizeof(cache_dir), DATA_DIR "/previews");
-            char cmd[MAX_PATH_BUF * 3];
-            snprintf(cmd, sizeof(cmd), "mkdir -p \"%s\"", cache_dir);
-            system(cmd);
-
-            snprintf(preview_path, sizeof(preview_path),
-                     DATA_DIR "/previews/%s.png", e->id);
-            if (access(preview_path, F_OK) != 0) {
-                snprintf(cmd, sizeof(cmd),
-                         "curl -sfLk -o \"%s\" -m 10 \"%s\"",
-                         preview_path, e->preview_url);
-                system(cmd);
-            }
-        }
-
-        if (access(preview_path, F_OK) == 0) {
+        bool found = resolve_preview(e, preview_path, sizeof(preview_path));
+        if (found) {
             preview_tex = ap_load_image(preview_path);
             if (preview_tex) {
                 SDL_QueryTexture(preview_tex, NULL, NULL, &preview_w, &preview_h);
@@ -742,7 +849,7 @@ static detail_result_t show_entry_detail(catalog_entry *e) {
             y += row_h;
         }
 
-        /* Preview image */
+        /* Preview image — always scale to fit width */
         if (preview_tex) {
             y += pad * 2;
             int max_w = sw - pad * 6;
@@ -795,36 +902,553 @@ static void delete_theme(catalog_entry *entry) {
 }
 
 /* -----------------------------------------------------------------------
- * Preview helper — returns path to preview image, downloading if needed
+ * Customize — per-system mix and match
  * ----------------------------------------------------------------------- */
 
-static bool resolve_preview_path(catalog_entry *e, char *out, int out_size) {
-    /* Check installed location first */
-    snprintf(out, out_size, "%s/%s/preview.png", THEMES_DIR, e->id);
-    if (access(out, F_OK) == 0) return true;
+/* A customizable slot: either a ROM system or a special folder */
+typedef struct {
+    char label[MAX_NAME_LEN];     /* display name */
+    char tag[64];                 /* system tag e.g. "(GBA)" or special key */
+    bool is_special;              /* true for Tools/Collections/Recently Played */
+    /* Paths to current asset on device (for preview) */
+    char wallpaper_path[MAX_PATH_BUF]; /* "" if not applicable */
+    char icon_path[MAX_PATH_BUF];      /* "" if not applicable */
+} customize_slot;
 
-    /* Check/download to cache */
-    snprintf(out, out_size, DATA_DIR "/previews/%s.png", e->id);
-    if (access(out, F_OK) == 0) return true;
+/*
+ * Find which installed themes have a specific wallpaper or icon asset.
+ * type: 'w' for wallpaper, 'i' for icon
+ * For wallpapers, checks universal wallpaper.png and per-system <tag>.png
+ * For icons, checks per-system <tag>.png or special icon files
+ */
+typedef struct {
+    catalog_entry *entry;
+    char asset_path[MAX_PATH_BUF]; /* path to the actual file in installed theme */
+} asset_option;
 
-    if (e->preview_url[0] != '\0') {
-        system("mkdir -p \"" DATA_DIR "/previews\"");
-        char cmd[MAX_PATH_BUF * 3];
-        snprintf(cmd, sizeof(cmd),
-                 "curl -sfLk -o \"%s\" -m 10 \"%s\"",
-                 out, e->preview_url);
-        if (system(cmd) == 0 && access(out, F_OK) == 0) return true;
+static int find_asset_options(const customize_slot *slot, char type,
+                              asset_option *out, int max_out) {
+    int count = 0;
+
+    for (int i = 0; i < catalog_count && count < max_out; i++) {
+        if (!catalog[i].installed) continue;
+
+        char theme_dir[MAX_PATH_BUF];
+        snprintf(theme_dir, sizeof(theme_dir), "%s/%s", THEMES_DIR, catalog[i].id);
+
+        char path[MAX_PATH_BUF];
+        bool found = false;
+
+        if (type == 'w' && catalog[i].has_wallpapers) {
+            if (slot->is_special) {
+                /* Special folders: only root wallpaper applies */
+                snprintf(path, sizeof(path), "%s/wallpapers/root.png", theme_dir);
+                if (access(path, F_OK) == 0) found = true;
+                if (!found) {
+                    snprintf(path, sizeof(path), "%s/wallpapers/wallpaper.png", theme_dir);
+                    if (access(path, F_OK) == 0) found = true;
+                }
+            } else {
+                /* ROM system: per-system first, then universal, then root fallback */
+                snprintf(path, sizeof(path), "%s/wallpapers/systems/%s.png",
+                         theme_dir, slot->tag);
+                if (access(path, F_OK) == 0) found = true;
+                if (!found) {
+                    snprintf(path, sizeof(path), "%s/wallpapers/wallpaper.png", theme_dir);
+                    if (access(path, F_OK) == 0) found = true;
+                }
+                if (!found) {
+                    snprintf(path, sizeof(path), "%s/wallpapers/root.png", theme_dir);
+                    if (access(path, F_OK) == 0) found = true;
+                }
+            }
+        } else if (type == 'i' && catalog[i].has_icons) {
+            if (slot->is_special) {
+                /* Special icon files */
+                if (strcmp(slot->tag, "tools") == 0) {
+                    snprintf(path, sizeof(path), "%s/icons/tools.png", theme_dir);
+                } else if (strcmp(slot->tag, "collections") == 0) {
+                    snprintf(path, sizeof(path), "%s/icons/collections.png", theme_dir);
+                } else if (strcmp(slot->tag, "recently_played") == 0) {
+                    snprintf(path, sizeof(path), "%s/icons/recently_played.png", theme_dir);
+                } else {
+                    continue;
+                }
+                if (access(path, F_OK) == 0) found = true;
+            } else {
+                snprintf(path, sizeof(path), "%s/icons/systems/%s.png",
+                         theme_dir, slot->tag);
+                if (access(path, F_OK) == 0) found = true;
+            }
+        }
+
+        if (found) {
+            out[count].entry = &catalog[i];
+            snprintf(out[count].asset_path, sizeof(out[count].asset_path), "%s", path);
+            count++;
+        }
+    }
+    return count;
+}
+
+/* Remove a single wallpaper for one system/slot */
+static void clear_single_wallpaper(const customize_slot *slot) {
+    if (slot->is_special) {
+        if (strcmp(slot->tag, "root") == 0) {
+            remove(ROOT_BG);
+        }
+        return;
+    }
+    for (int i = 0; i < system_count; i++) {
+        if (strcmp(systems[i].tag, slot->tag) == 0) {
+            char path[MAX_PATH_BUF];
+            snprintf(path, sizeof(path), "%s/.media/bg.png", systems[i].rom_dir);
+            remove(path);
+            snprintf(path, sizeof(path), "%s/.media/bglist.png", systems[i].rom_dir);
+            remove(path);
+            break;
+        }
+    }
+}
+
+/* Remove a single icon for one system/slot */
+static void clear_single_icon(const customize_slot *slot) {
+    if (slot->is_special) {
+        if (strcmp(slot->tag, "tools") == 0) {
+            remove(SDCARD_ROOT "/Tools/.media/" PLATFORM_TAG ".png");
+        } else if (strcmp(slot->tag, "collections") == 0) {
+            remove(SDCARD_ROOT "/.media/Collections.png");
+        } else if (strcmp(slot->tag, "recently_played") == 0) {
+            remove(SDCARD_ROOT "/.media/Recently Played.png");
+        }
+        return;
+    }
+    for (int i = 0; i < system_count; i++) {
+        if (strcmp(systems[i].tag, slot->tag) == 0) {
+            char path[MAX_PATH_BUF];
+            snprintf(path, sizeof(path), "%s/%s.png", ROMS_MEDIA_DIR, systems[i].name);
+            remove(path);
+            break;
+        }
+    }
+}
+
+/* Apply a single wallpaper for one system/slot */
+static void apply_single_wallpaper(const customize_slot *slot, const char *src_path) {
+    if (slot->is_special) {
+        /* Special folders only get root bg */
+        if (strcmp(slot->tag, "root") == 0) {
+            copy_file(src_path, ROOT_BG);
+        }
+        /* Other special folders don't have wallpapers on device */
+        return;
     }
 
-    out[0] = '\0';
-    return false;
+    /* Find the system entry to get rom_dir */
+    for (int i = 0; i < system_count; i++) {
+        if (strcmp(systems[i].tag, slot->tag) == 0) {
+            char dst[MAX_PATH_BUF];
+            snprintf(dst, sizeof(dst), "%s/.media/bg.png", systems[i].rom_dir);
+            copy_file(src_path, dst);
+            snprintf(dst, sizeof(dst), "%s/.media/bglist.png", systems[i].rom_dir);
+            copy_file(src_path, dst);
+            break;
+        }
+    }
+}
+
+/* Apply a single icon for one system/slot */
+static void apply_single_icon(const customize_slot *slot, const char *src_path) {
+    if (slot->is_special) {
+        if (strcmp(slot->tag, "tools") == 0) {
+            copy_file(src_path, SDCARD_ROOT "/Tools/.media/" PLATFORM_TAG ".png");
+        } else if (strcmp(slot->tag, "collections") == 0) {
+            copy_file(src_path, SDCARD_ROOT "/.media/Collections.png");
+        } else if (strcmp(slot->tag, "recently_played") == 0) {
+            copy_file(src_path, SDCARD_ROOT "/.media/Recently Played.png");
+        }
+        return;
+    }
+
+    for (int i = 0; i < system_count; i++) {
+        if (strcmp(systems[i].tag, slot->tag) == 0) {
+            char dst[MAX_PATH_BUF];
+            snprintf(dst, sizeof(dst), "%s/%s.png", ROMS_MEDIA_DIR, systems[i].name);
+            copy_file(src_path, dst);
+            break;
+        }
+    }
+}
+
+/* Show a picker for a specific asset type (wallpaper or icon) for a slot.
+ * Displays the actual asset image from each installed theme as preview. */
+static void show_asset_picker(const customize_slot *slot, char type) {
+    asset_option options[MAX_ENTRIES];
+    int count = find_asset_options(slot, type, options, MAX_ENTRIES);
+
+    if (count == 0) {
+        pakkit_message("No installed themes have this asset.", "OK");
+        return;
+    }
+
+    /* total_count = "None" + theme options */
+    int total_count = count + 1;
+
+    char title[256];
+    snprintf(title, sizeof(title), "%s - %s",
+             slot->label, type == 'w' ? "Wallpaper" : "Icon");
+
+    int cursor = 0;
+    SDL_Texture *preview_tex = NULL;
+    int preview_w = 0, preview_h = 0;
+    int last_preview = -1;
+
+    for (;;) {
+        ap_input_event ev;
+        while (ap_poll_input(&ev)) {
+            if (ev.pressed) {
+                switch (ev.button) {
+                    case AP_BTN_B:
+                        if (!ev.repeated) {
+                            if (preview_tex) SDL_DestroyTexture(preview_tex);
+                            return;
+                        }
+                        break;
+                    case AP_BTN_A:
+                        if (!ev.repeated) {
+                            if (cursor == 0) {
+                                /* None — clear the asset */
+                                if (type == 'w')
+                                    clear_single_wallpaper(slot);
+                                else
+                                    clear_single_icon(slot);
+                                if (preview_tex) SDL_DestroyTexture(preview_tex);
+                                pakkit_message("Cleared!", "OK");
+                            } else {
+                                int opt_idx = cursor - 1;
+                                if (type == 'w')
+                                    apply_single_wallpaper(slot, options[opt_idx].asset_path);
+                                else
+                                    apply_single_icon(slot, options[opt_idx].asset_path);
+                                if (preview_tex) SDL_DestroyTexture(preview_tex);
+                                pakkit_message("Applied!", "OK");
+                            }
+                            return;
+                        }
+                        break;
+                    case AP_BTN_UP:
+                        cursor--;
+                        if (cursor < 0) cursor = total_count - 1;
+                        break;
+                    case AP_BTN_DOWN:
+                        cursor++;
+                        if (cursor >= total_count) cursor = 0;
+                        break;
+                    default:
+                        break;
+                }
+            }
+        }
+
+        /* Load preview when cursor changes */
+        if (cursor != last_preview) {
+            if (preview_tex) { SDL_DestroyTexture(preview_tex); preview_tex = NULL; }
+            if (cursor > 0) {
+                preview_tex = ap_load_image(options[cursor - 1].asset_path);
+                if (preview_tex) {
+                    SDL_QueryTexture(preview_tex, NULL, NULL, &preview_w, &preview_h);
+                }
+            }
+            last_preview = cursor;
+        }
+
+        int sw = ap_get_screen_width();
+        int sh = ap_get_screen_height();
+        int pad = AP_DS(5);
+
+        TTF_Font *font_med   = ap_get_font(AP_FONT_MEDIUM);
+        TTF_Font *font_small = ap_get_font(AP_FONT_SMALL);
+        TTF_Font *font_tiny  = ap_get_font(AP_FONT_TINY);
+
+        int item_h = TTF_FontHeight(font_small) + pad * 3;
+        int title_h = TTF_FontHeight(font_med) + pad * 3 + 1 + pad * 3;
+        int hint_h = TTF_FontHeight(font_tiny) + pad * 2;
+        bool show_preview = (cursor > 0 && preview_tex);
+        int list_area_w = show_preview ? (sw * 2 / 5) : sw;
+        int list_h = sh - title_h - hint_h - pad;
+        int visible = list_h / item_h;
+        if (visible < 1) visible = 1;
+
+        static int scroll = 0;
+        if (cursor < scroll) scroll = cursor;
+        if (cursor >= scroll + visible) scroll = cursor - visible + 1;
+
+        ap_clear_screen();
+        ap_draw_background();
+
+        /* Preview */
+        if (preview_tex) {
+            if (type == 'i') {
+                /* Icon: fit into right panel */
+                int right_x = list_area_w;
+                int right_w = sw - list_area_w;
+                int max_h = sh * 2 / 3;
+                int max_w = right_w - pad * 8;
+                float scale_w = (float)max_w / (float)preview_w;
+                float scale_h = (float)max_h / (float)preview_h;
+                float scale = (scale_w < scale_h) ? scale_w : scale_h;
+                if (scale > 1.0f) scale = 1.0f;
+                int draw_w = (int)(preview_w * scale);
+                int draw_h = (int)(preview_h * scale);
+                int draw_x = right_x + (right_w - draw_w) / 2;
+                int draw_y = (sh - draw_h) / 2;
+                ap_draw_image(preview_tex, draw_x, draw_y, draw_w, draw_h);
+            } else {
+                /* Wallpaper: fit to screen (letterbox) so full image is visible */
+                float scale_w = (float)sw / (float)preview_w;
+                float scale_h = (float)sh / (float)preview_h;
+                float scale = (scale_w < scale_h) ? scale_w : scale_h;
+                int draw_w = (int)(preview_w * scale);
+                int draw_h = (int)(preview_h * scale);
+                int draw_x = (sw - draw_w) / 2;
+                int draw_y = (sh - draw_h) / 2;
+                ap_draw_image(preview_tex, draw_x, draw_y, draw_w, draw_h);
+            }
+        }
+
+        /* Overlay so list text is readable over wallpaper preview */
+        if (preview_tex && type == 'w') {
+            ap_color overlay = {0, 0, 0, 140};
+            ap_draw_rect(0, 0, list_area_w, sh, overlay);
+        }
+
+        ap_theme *theme = ap_get_theme();
+        ap_color text_color = theme->text;
+        ap_color hint_color = theme->hint;
+        ap_color highlight  = theme->highlight;
+        ap_color hl_text    = theme->highlighted_text;
+
+        int y = pad * 3;
+        ap_draw_text(font_med, title, pad * 3, y, hint_color);
+        y += TTF_FontHeight(font_med) + pad * 3;
+
+        int list_top = y;
+        int max_text_w = list_area_w - pad * 8;
+
+        SDL_Rect clip = { 0, list_top, list_area_w, list_h };
+        SDL_RenderSetClipRect(ap__g.renderer, &clip);
+
+        for (int i = scroll; i < total_count && i < scroll + visible; i++) {
+            int item_y = list_top + (i - scroll) * item_h;
+            int text_y = item_y + (item_h - TTF_FontHeight(font_small)) / 2;
+
+            const char *label = (i == 0) ? "None" : options[i - 1].entry->name;
+
+            if (i == cursor) {
+                int tw = ap_measure_text_ellipsized(font_small, label, max_text_w);
+                int pill_w = tw + pad * 4;
+                ap_draw_pill(pad * 2, item_y, pill_w, item_h, highlight);
+                ap_draw_text_ellipsized(font_small, label,
+                                        pad * 4, text_y, hl_text, max_text_w);
+            } else {
+                ap_draw_text_ellipsized(font_small, label,
+                                        pad * 4, text_y, text_color, max_text_w);
+            }
+        }
+
+        SDL_RenderSetClipRect(ap__g.renderer, NULL);
+
+        /* Scrollbar */
+        if (total_count > visible) {
+            int bar_x = list_area_w - pad * 2;
+            int thumb_h = (visible * list_h) / total_count;
+            if (thumb_h < pad * 2) thumb_h = pad * 2;
+            int thumb_y = list_top + (scroll * (list_h - thumb_h)) / (total_count - visible);
+            ap_color bar_color = { hint_color.r, hint_color.g, hint_color.b, 80 };
+            ap_color thumb_color = { hint_color.r, hint_color.g, hint_color.b, 160 };
+            ap_draw_rect(bar_x, list_top, 3, list_h, bar_color);
+            ap_draw_rect(bar_x, thumb_y, 3, thumb_h, thumb_color);
+        }
+
+        pakkit_hint hints[] = {
+            {"B", "BACK"},
+            {"A", "APPLY"},
+        };
+        pakkit_draw_hints(hints, 2);
+
+        ap_present();
+    }
+}
+
+/* Show the per-system customize screen for one slot */
+static void show_customize_slot(customize_slot *slot) {
+    bool has_wp = !slot->is_special || strcmp(slot->tag, "root") == 0;
+    bool has_ic = slot->icon_path[0] != '\0' || !slot->is_special;
+
+    /* If only one type available, go straight to picker */
+    if (has_wp && !has_ic) {
+        show_asset_picker(slot, 'w');
+        return;
+    }
+    if (!has_wp && has_ic) {
+        show_asset_picker(slot, 'i');
+        return;
+    }
+
+    pakkit_menu_result result = {0};
+    for (;;) {
+        pakkit_menu_item items[] = {
+            {"Wallpaper"},
+            {"Icon"},
+        };
+
+        char title[256];
+        snprintf(title, sizeof(title), "Customize - %s", slot->label);
+
+        pakkit_menu(title, items, 2, &result);
+
+        if (result.selected_index < 0)
+            return;
+
+        if (result.selected_index == 0) {
+            show_asset_picker(slot, 'w');
+        } else {
+            show_asset_picker(slot, 'i');
+        }
+    }
+}
+
+/* Main customize screen — list of systems + special folders */
+static void show_customize(void) {
+    customize_slot slots[MAX_ENTRIES];
+    int slot_count = 0;
+
+    /* Special folders first */
+    customize_slot *s;
+
+    /* Root wallpaper */
+    s = &slots[slot_count++];
+    snprintf(s->label, sizeof(s->label), "Main Menu");
+    snprintf(s->tag, sizeof(s->tag), "root");
+    s->is_special = true;
+    snprintf(s->wallpaper_path, sizeof(s->wallpaper_path), "%s", ROOT_BG);
+    s->icon_path[0] = '\0';
+
+    s = &slots[slot_count++];
+    snprintf(s->label, sizeof(s->label), "Tools");
+    snprintf(s->tag, sizeof(s->tag), "tools");
+    s->is_special = true;
+    s->wallpaper_path[0] = '\0';
+    snprintf(s->icon_path, sizeof(s->icon_path),
+             SDCARD_ROOT "/Tools/.media/" PLATFORM_TAG ".png");
+
+    s = &slots[slot_count++];
+    snprintf(s->label, sizeof(s->label), "Collections");
+    snprintf(s->tag, sizeof(s->tag), "collections");
+    s->is_special = true;
+    s->wallpaper_path[0] = '\0';
+    snprintf(s->icon_path, sizeof(s->icon_path),
+             SDCARD_ROOT "/.media/Collections.png");
+
+    s = &slots[slot_count++];
+    snprintf(s->label, sizeof(s->label), "Recently Played");
+    snprintf(s->tag, sizeof(s->tag), "recently_played");
+    s->is_special = true;
+    s->wallpaper_path[0] = '\0';
+    snprintf(s->icon_path, sizeof(s->icon_path),
+             SDCARD_ROOT "/.media/Recently Played.png");
+
+    /* ROM systems (only ones with content) */
+    for (int i = 0; i < system_count; i++) {
+        /* Check if system has any ROMs (skip empty dirs) */
+        DIR *d = opendir(systems[i].rom_dir);
+        if (!d) continue;
+
+        bool has_content = false;
+        struct dirent *ent;
+        while ((ent = readdir(d)) != NULL) {
+            if (ent->d_name[0] == '.') continue;
+            has_content = true;
+            break;
+        }
+        closedir(d);
+
+        if (!has_content) continue;
+
+        s = &slots[slot_count];
+        /* Use system name but strip the tag for cleaner display */
+        char *paren = strrchr(systems[i].name, '(');
+        if (paren && paren > systems[i].name) {
+            int len = (int)(paren - systems[i].name);
+            while (len > 0 && systems[i].name[len - 1] == ' ') len--;
+            snprintf(s->label, sizeof(s->label), "%.*s", len, systems[i].name);
+        } else {
+            snprintf(s->label, sizeof(s->label), "%s", systems[i].name);
+        }
+        snprintf(s->tag, sizeof(s->tag), "%s", systems[i].tag);
+        s->is_special = false;
+        snprintf(s->wallpaper_path, sizeof(s->wallpaper_path),
+                 "%s/.media/bg.png", systems[i].rom_dir);
+        snprintf(s->icon_path, sizeof(s->icon_path),
+                 "%s/%s.png", ROMS_MEDIA_DIR, systems[i].name);
+        slot_count++;
+    }
+
+    if (slot_count == 0) {
+        pakkit_message("No systems found.", "OK");
+        return;
+    }
+
+    /* Sort ROM systems alphabetically (keep specials at top) */
+    /* Specials are first 4 entries, ROM systems start at index 4 */
+    int special_count = 4;
+    if (slot_count > special_count + 1) {
+        for (int i = special_count; i < slot_count - 1; i++) {
+            for (int j = i + 1; j < slot_count; j++) {
+                if (strcasecmp(slots[i].label, slots[j].label) > 0) {
+                    customize_slot tmp = slots[i];
+                    slots[i] = slots[j];
+                    slots[j] = tmp;
+                }
+            }
+        }
+    }
+
+    pakkit_list_item items[MAX_ENTRIES];
+    for (int i = 0; i < slot_count; i++) {
+        items[i].label = slots[i].label;
+    }
+
+    int cursor = 0;
+    for (;;) {
+        pakkit_hint hints[] = {
+            {"B", "BACK"},
+            {"A", "SELECT"},
+        };
+
+        pakkit_list_opts opts = {0};
+        opts.title = "Customize";
+        opts.hints = hints;
+        opts.hint_count = 2;
+        opts.initial_index = cursor;
+        opts.text_width_pills = true;
+
+        pakkit_list_result result;
+        pakkit_list(&opts, items, slot_count, &result);
+
+        if (result.action == PAKKIT_ACTION_BACK)
+            return;
+
+        cursor = result.selected_index;
+        show_customize_slot(&slots[cursor]);
+    }
 }
 
 /* -----------------------------------------------------------------------
  * UI flows — each returns when the user backs out
  * ----------------------------------------------------------------------- */
 
-static void show_entry_list(const char *title, filtered_list *list) {
+static void show_entry_list(const char *title, filtered_list *list, category_t cat) {
     if (list->count == 0) {
         pakkit_message("Nothing here yet", "OK");
         return;
@@ -869,16 +1493,38 @@ reenter:
         }
 
         /* Load preview when cursor changes */
+        bool preview_loading = false;
         if (cursor != last_preview) {
             if (preview_tex) { SDL_DestroyTexture(preview_tex); preview_tex = NULL; }
+
             char preview_path[MAX_PATH_BUF];
-            if (resolve_preview_path(list->entries[cursor], preview_path, sizeof(preview_path))) {
+            if (resolve_preview_local(list->entries[cursor], preview_path, sizeof(preview_path))) {
+                /* Cached or installed — load immediately */
                 preview_tex = ap_load_image(preview_path);
                 if (preview_tex) {
                     SDL_QueryTexture(preview_tex, NULL, NULL, &preview_w, &preview_h);
                 }
+            } else if (list->entries[cursor]->preview_url[0] != '\0') {
+                /* Not cached — start download (previous download detaches and keeps going) */
+                snprintf(preview_path, sizeof(preview_path),
+                         DATA_DIR "/previews/%s.preview.png", list->entries[cursor]->id);
+                async_download_start(list->entries[cursor]->preview_url,
+                                     preview_path, list->entries[cursor]->id);
+                preview_loading = true;
             }
             last_preview = cursor;
+        }
+
+        /* Check if async download completed */
+        if (!preview_tex && async_dl.pid > 0) {
+            preview_loading = true;
+            if (async_download_poll()) {
+                preview_tex = ap_load_image(async_dl.cache_path);
+                if (preview_tex) {
+                    SDL_QueryTexture(preview_tex, NULL, NULL, &preview_w, &preview_h);
+                }
+                preview_loading = false;
+            }
         }
 
         int sw = ap_get_screen_width();
@@ -905,17 +1551,50 @@ reenter:
         ap_clear_screen();
         ap_draw_background();
 
-        /* Preview as full-screen background */
-        if (preview_tex) {
-            float scale_w = (float)sw / (float)preview_w;
-            float scale_h = (float)sh / (float)preview_h;
-            float scale = (scale_w > scale_h) ? scale_w : scale_h;
-            int draw_w = (int)(preview_w * scale);
-            int draw_h = (int)(preview_h * scale);
-            int draw_x = (sw - draw_w) / 2;
-            int draw_y = (sh - draw_h) / 2;
-            ap_draw_image(preview_tex, draw_x, draw_y, draw_w, draw_h);
+        /* Preview image or loading indicator */
+        bool is_icon_only = (cat == CATEGORY_ICONS &&
+                             list->entries[cursor]->has_icons &&
+                             !list->entries[cursor]->has_wallpapers);
 
+        if (preview_loading && !preview_tex) {
+            ap_color loading_color = {255, 255, 255, 120};
+            int lw = ap_measure_text(font_small, "Loading...");
+            ap_draw_text(font_small, "Loading...",
+                         sw - lw - pad * 4, sh / 2, loading_color);
+        }
+        if (preview_tex) {
+            if (is_icon_only) {
+                /* Icon packs: show preview centered in the right area, not fullscreen */
+                int right_x = list_area_w;
+                int right_w = sw - list_area_w;
+                int max_h = sh * 2 / 3;
+                int max_w = right_w - pad * 8;
+                float scale_w = (float)max_w / (float)preview_w;
+                float scale_h = (float)max_h / (float)preview_h;
+                float scale = (scale_w < scale_h) ? scale_w : scale_h;
+                if (scale > 1.0f) scale = 1.0f;
+                int draw_w = (int)(preview_w * scale);
+                int draw_h = (int)(preview_h * scale);
+                int draw_x = right_x + (right_w - draw_w) / 2;
+                int draw_y = (sh - draw_h) / 2;
+                ap_draw_image(preview_tex, draw_x, draw_y, draw_w, draw_h);
+            } else {
+                /* Wallpapers/themes: fill screen as background */
+                float scale_w = (float)sw / (float)preview_w;
+                float scale_h = (float)sh / (float)preview_h;
+                float scale = (scale_w > scale_h) ? scale_w : scale_h;
+                int draw_w = (int)(preview_w * scale);
+                int draw_h = (int)(preview_h * scale);
+                int draw_x = (sw - draw_w) / 2;
+                int draw_y = (sh - draw_h) / 2;
+                ap_draw_image(preview_tex, draw_x, draw_y, draw_w, draw_h);
+            }
+        }
+
+        /* Semi-transparent overlay so list text is readable over preview */
+        if (preview_tex && !is_icon_only) {
+            ap_color overlay = {0, 0, 0, 140};
+            ap_draw_rect(0, 0, list_area_w, sh, overlay);
         }
 
         ap_theme *theme = ap_get_theme();
@@ -974,6 +1653,7 @@ reenter:
         ap_present();
     }
 
+    async_download_cancel();
     if (preview_tex) { SDL_DestroyTexture(preview_tex); preview_tex = NULL; }
 
     if (selected < 0) return;
@@ -981,7 +1661,7 @@ reenter:
     catalog_entry *e = list->entries[selected];
 
     /* Show detail screen — A=action, B=back, X=delete */
-    detail_result_t dr = show_entry_detail(e);
+    detail_result_t dr = show_entry_detail(e, cat);
 
     if (dr == DETAIL_BACK) {
         cursor = selected;
@@ -1100,7 +1780,7 @@ static void show_browse_installed(const char *category_name, category_t cat) {
             filtered_list list = filter_catalog(cat, false);
             char browse_title[128];
             snprintf(browse_title, sizeof(browse_title), "%s - Browse", category_name);
-            show_entry_list(browse_title, &list);
+            show_entry_list(browse_title, &list, cat);
         } else {
             /* Installed — direct apply/delete, no detail screen */
             scan_installed();
@@ -1148,6 +1828,11 @@ int main(int argc, char *argv[]) {
     /* Discover systems on device */
     discover_systems();
 
+    /* Auto-backup on first run so Restore always has a baseline */
+    if (!has_backup()) {
+        backup_current();
+    }
+
     /* Fetch and parse theme catalog */
     pakkit_loading("Fetching catalog...");
     if (!fetch_catalog_json()) {
@@ -1169,10 +1854,11 @@ int main(int argc, char *argv[]) {
             {"Themes"},
             {"Wallpapers"},
             {"Icons"},
+            {"Customize"},
             {"Restore Backup"},
         };
 
-        pakkit_menu("TheyTheMeRollin", items, 4, &result);
+        pakkit_menu("TheyTheMeRollin", items, 5, &result);
 
         if (result.selected_index < 0)
             break;
@@ -1181,6 +1867,10 @@ int main(int argc, char *argv[]) {
             const char *names[] = {"Themes", "Wallpapers", "Icons"};
             category_t cats[] = {CATEGORY_THEMES, CATEGORY_WALLPAPERS, CATEGORY_ICONS};
             show_browse_installed(names[result.selected_index], cats[result.selected_index]);
+        } else if (result.selected_index == 3) {
+            /* Customize — per-system mix and match */
+            scan_installed();
+            show_customize();
         } else {
             /* Restore backup */
             if (!has_backup()) {

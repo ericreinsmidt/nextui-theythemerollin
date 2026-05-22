@@ -1,16 +1,18 @@
 {
   "name": "TheyTheMeRollin",
-  "version": "v0.1.0",
+  "version": "v0.2.0",
   "type": "TOOL",
-  "description": "Theme manager for NextUI. Browse, download, and apply wallpapers and icons on TrimUI Brick and Smart Pro.",
+  "description": "Theme manager for NextUI. Browse, download, and apply wallpapers and icons. Mix and match per system with Customize.",
   "author": "Eric Reinsmidt",
   "repo_url": "https://github.com/ericreinsmidt/nextui-theythemerollin",
-  "release_filename": "TheyTheMeRollin.tg5040.pak.zip",
+  "release_filename": "TheyTheMeRollin.pakz",
   "platforms": [
-    "tg5040"
+    "tg5040",
+    "tg5050"
   ],
   "changelog": {
-    "v0.1.0": "Initial release."
+    "v0.1.0": "Initial release.",
+    "v0.2.0": "Add Customize per-system mix & match, async preview downloads, tg5050 support, and None/clear option."
   },
   "screenshots": [
     "assets/logo.png"

@@ -1,15 +1,23 @@
 # TheyTheMeRollin
 
-A theme manager for [NextUI](https://github.com/LoveRetro/NextUI) on TrimUI handhelds (Brick, Smart Pro).
+A theme manager for [NextUI](https://github.com/LoveRetro/NextUI) on TrimUI handhelds.
 
-Browse, download, and apply community-made wallpaper and icon themes directly on your device.
+Browse, download, and apply community-made wallpaper and icon themes directly on your device. Mix and match individual wallpapers and icons per system for a fully custom setup.
+
+## Supported Devices
+
+- **tg5040** — TrimUI Brick, Smart Pro
+- **tg5050** — TrimUI Smart Pro S
 
 ## Features
 
-- **Browse** themes from a community catalog with full-screen preview images
+- **Browse** themes from a community catalog with live preview images
 - **Download and install** themes with one button
-- **Apply** wallpapers (per-system or universal) and system icons
+- **Apply** full theme packs, wallpaper sets, or icon sets
+- **Customize** — mix and match wallpapers and icons per system from any installed theme
+- **Clear** individual wallpapers or icons to revert to defaults
 - **Backup and restore** your current theme before making changes
+- **Async preview loading** — previews download in the background and cache as you scroll
 - **Delete** installed themes to free up space
 
 ## How It Works
@@ -18,20 +26,22 @@ TheyTheMeRollin fetches a theme catalog from GitHub when you launch it. You can 
 
 Before applying a theme, the app automatically backs up your current wallpapers and icons so you can restore them later.
 
-## Theme Categories
+## Menu Structure
 
 - **Themes** — full packages with both wallpapers and icons
 - **Wallpapers** — wallpaper packs (menu backgrounds)
 - **Icons** — icon packs (system icons)
+- **Customize** — per-system mix and match from installed themes
+- **Restore Backup** — revert to your original theme
 
 ## Installation
 
-TheyTheMeRollin is available in the [Pak Store](https://github.com/LoveRetro/nextui-pak-store). Connect your device to Wi-Fi and install it from the Tools menu.
-
 ### Manual Installation
 
-1. Download the latest release from the [Releases](https://github.com/ericreinsmidt/nextui-theythemerollin/releases) page
-2. Unzip and copy the `TheyTheMeRollin.pak` folder to `SD_ROOT/Tools/tg5040`
+1. Download the latest release for your device from the [Releases](https://github.com/ericreinsmidt/nextui-theythemerollin/releases) page
+2. Unzip and copy the `TheyTheMeRollin.pak` folder to:
+   - Brick / Smart Pro: `SD_ROOT/Tools/tg5040/`
+   - Smart Pro S: `SD_ROOT/Tools/tg5050/`
 3. Launch from the Tools menu
 
 ## Creating Themes
@@ -40,19 +50,26 @@ Want to make a theme? Check the [Theme Catalog](https://github.com/ericreinsmidt
 
 ## Building from Source
 
-Requires the NextUI tg5040 Docker toolchain:
+Requires the NextUI Docker toolchain for your target platform:
 
 ```bash
-# Build
+# Brick / Smart Pro (tg5040)
 cd ports/tg5040
 docker run --rm -v "$(cd ../.. && pwd)":/build -w /build/ports/tg5040 \
   ghcr.io/loveretro/tg5040-toolchain make clean all
 
-# Package
-bash scripts/package_pak.sh
+# Smart Pro S (tg5050)
+cd ports/tg5050
+docker run --rm -v "$(cd ../.. && pwd)":/build -w /build/ports/tg5050 \
+  ghcr.io/loveretro/tg5050-toolchain make clean all
 ```
 
-Output: `dist/TheyTheMeRollin.tg5040.pak.zip`
+Package for distribution:
+
+```bash
+cd ports/tg5040 && zip -r ../../dist/TheyTheMeRollin.tg5040.pak.zip pak/
+cd ports/tg5050 && zip -r ../../dist/TheyTheMeRollin.tg5050.pak.zip pak/
+```
 
 ## Credits
 
