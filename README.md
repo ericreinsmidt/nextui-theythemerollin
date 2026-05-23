@@ -1,8 +1,18 @@
 # TheyTheMeRollin
 
+<!-- TODO: Add logo -->
+<!-- ![TheyTheMeRollin](assets/logo.png) -->
+
 A theme manager for [NextUI](https://github.com/LoveRetro/NextUI) on TrimUI handhelds.
 
 Browse, download, and apply community-made wallpaper and icon themes directly on your device. Mix and match individual wallpapers and icons per system for a fully custom setup.
+
+## Screenshots
+
+<!-- TODO: Add screenshots -->
+<!-- ![Main Menu](assets/screenshots/main_menu.png) -->
+<!-- ![Browse](assets/screenshots/browse.png) -->
+<!-- ![Customize](assets/screenshots/customize.png) -->
 
 ## Supported Devices
 
@@ -38,10 +48,8 @@ Before applying a theme, the app automatically backs up your current wallpapers 
 
 ### Manual Installation
 
-1. Download the latest release for your device from the [Releases](https://github.com/ericreinsmidt/nextui-theythemerollin/releases) page
-2. Unzip and copy the `TheyTheMeRollin.pak` folder to:
-   - Brick / Smart Pro: `SD_ROOT/Tools/tg5040/`
-   - Smart Pro S: `SD_ROOT/Tools/tg5050/`
+1. Download the latest `.pakz` from the [Releases](https://github.com/ericreinsmidt/nextui-theythemerollin/releases) page
+2. Extract and copy the `Tools/` folder to your SD card root — it contains builds for all supported platforms
 3. Launch from the Tools menu
 
 ## Creating Themes
@@ -67,8 +75,10 @@ docker run --rm -v "$(cd ../.. && pwd)":/build -w /build/ports/tg5050 \
 Package for distribution:
 
 ```bash
-cd ports/tg5040 && zip -r ../../dist/TheyTheMeRollin.tg5040.pak.zip pak/
-cd ports/tg5050 && zip -r ../../dist/TheyTheMeRollin.tg5050.pak.zip pak/
+mkdir -p dist/pakz/Tools/tg5040 dist/pakz/Tools/tg5050
+cp -r ports/tg5040/pak dist/pakz/Tools/tg5040/TheyTheMeRollin.pak
+cp -r ports/tg5050/pak dist/pakz/Tools/tg5050/TheyTheMeRollin.pak
+cd dist/pakz && zip -r ../TheyTheMeRollin.pakz Tools/
 ```
 
 ## Credits
