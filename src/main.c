@@ -456,12 +456,53 @@ static void restore_backup(void) {
 }
 
 /* -----------------------------------------------------------------------
+ * Clear all assets (before applying a new set)
+ * ----------------------------------------------------------------------- */
+
+static void clear_all_wallpapers(void) {
+    remove(ROOT_BG);
+    for (int i = 0; i < system_count; i++) {
+        char path[MAX_PATH_BUF];
+        snprintf(path, sizeof(path), "%s/.media/bg.png", systems[i].rom_dir);
+        remove(path);
+        snprintf(path, sizeof(path), "%s/.media/bglist.png", systems[i].rom_dir);
+        remove(path);
+    }
+}
+
+static void clear_all_icons(void) {
+    /* System icons */
+    for (int i = 0; i < system_count; i++) {
+        char path[MAX_PATH_BUF];
+        snprintf(path, sizeof(path), "%s/%s.png", ROMS_MEDIA_DIR, systems[i].name);
+        remove(path);
+    }
+    /* Special folder icons */
+    remove(SDCARD_ROOT "/.media/Collections.png");
+    remove(SDCARD_ROOT "/.media/Recently Played.png");
+    /* Tools pak icons (all PNGs except bg.png) */
+    char cmd[MAX_PATH_BUF];
+    snprintf(cmd, sizeof(cmd),
+             "find \"" TOOLS_DIR "/.media\" -maxdepth 1 -name '*.png' "
+             "! -name 'bg.png' -exec rm -f {} +");
+    system(cmd);
+}
+
+/* -----------------------------------------------------------------------
  * Apply theme
  * ----------------------------------------------------------------------- */
 
-static void apply_theme(catalog_entry *entry) {
+static void apply_theme(catalog_entry *entry, category_t cat) {
     char theme_dir[MAX_PATH_LEN];
     snprintf(theme_dir, sizeof(theme_dir), "%s/%s", THEMES_DIR, entry->id);
+
+    /* Clear before apply: Themes clears everything, otherwise only the relevant type */
+    if (cat == CATEGORY_THEMES || cat == CATEGORY_WALLPAPERS) {
+        clear_all_wallpapers();
+    }
+    if (cat == CATEGORY_THEMES || cat == CATEGORY_ICONS) {
+        clear_all_icons();
+    }
 
     if (entry->has_wallpapers) {
         if (strcmp(entry->wallpaper_mode, "universal") == 0) {
@@ -1431,7 +1472,7 @@ static void show_customize(void) {
         opts.hints = hints;
         opts.hint_count = 2;
         opts.initial_index = cursor;
-        opts.text_width_pills = true;
+        /* pills are full-width in pakkit */
 
         pakkit_list_result result;
         pakkit_list(&opts, items, slot_count, &result);
@@ -1677,7 +1718,7 @@ reenter:
     } else if (e->installed) {
         pakkit_loading("Backing up & applying...");
         backup_current();
-        apply_theme(e);
+        apply_theme(e, cat);
         pakkit_message("Theme applied!", "OK");
     } else {
         pakkit_loading("Downloading...");
@@ -1686,7 +1727,7 @@ reenter:
             if (pakkit_confirm("Apply now?", "APPLY", "LATER")) {
                 pakkit_loading("Backing up & applying...");
                 backup_current();
-                apply_theme(e);
+                apply_theme(e, cat);
                 pakkit_message("Theme applied!", "OK");
             }
         } else {
@@ -1700,7 +1741,7 @@ reenter:
     goto reenter;
 }
 
-static void show_installed_list(const char *title, filtered_list *list) {
+static void show_installed_list(const char *title, filtered_list *list, category_t cat) {
     if (list->count == 0) {
         pakkit_message("Nothing here yet", "OK");
         return;
@@ -1724,7 +1765,7 @@ static void show_installed_list(const char *title, filtered_list *list) {
         opts.hints = hints;
         opts.hint_count = 3;
         opts.initial_index = cursor;
-        opts.text_width_pills = true;
+        /* pills are full-width in pakkit */
         opts.secondary_button = AP_BTN_X;
 
         pakkit_list_result result;
@@ -1751,7 +1792,7 @@ static void show_installed_list(const char *title, filtered_list *list) {
             /* Apply */
             pakkit_loading("Backing up & applying...");
             backup_current();
-            apply_theme(e);
+            apply_theme(e, cat);
             pakkit_message("Theme applied!", "OK");
         }
     }
@@ -1787,7 +1828,7 @@ static void show_browse_installed(const char *category_name, category_t cat) {
             filtered_list list = filter_catalog(cat, true);
             char installed_title[128];
             snprintf(installed_title, sizeof(installed_title), "%s - Installed", category_name);
-            show_installed_list(installed_title, &list);
+            show_installed_list(installed_title, &list, cat);
         }
     }
 }
@@ -1855,10 +1896,11 @@ int main(int argc, char *argv[]) {
             {"Wallpapers"},
             {"Icons"},
             {"Customize"},
+            {"Clear All"},
             {"Restore Backup"},
         };
 
-        pakkit_menu("TheyTheMeRollin", items, 5, &result);
+        pakkit_menu("TheyTheMeRollin", items, 6, &result);
 
         if (result.selected_index < 0)
             break;
@@ -1871,6 +1913,14 @@ int main(int argc, char *argv[]) {
             /* Customize — per-system mix and match */
             scan_installed();
             show_customize();
+        } else if (result.selected_index == 4) {
+            /* Clear All — remove all custom wallpapers and icons */
+            if (pakkit_confirm("Remove all wallpapers and icons?", "CLEAR", "CANCEL")) {
+                pakkit_loading("Clearing...");
+                clear_all_wallpapers();
+                clear_all_icons();
+                pakkit_message("Cleared!", "OK");
+            }
         } else {
             /* Restore backup */
             if (!has_backup()) {
